@@ -13,6 +13,14 @@ class HGVSInternalError(HGVSError):
     pass
 
 
+class HGVSJSONError(HGVSError):
+    """Exception raised when encoding to or decoding from structured HGVS JSON fails
+
+    This covers unsupported schema versions, unknown object types or
+    structures, malformed payloads, and (in strict mode) unexpected fields.
+    """
+
+
 class HGVSInvalidIntervalError(HGVSError):
     pass
 
