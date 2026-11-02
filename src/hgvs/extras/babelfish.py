@@ -17,12 +17,22 @@ and reading them back::
     # NC_000017.11:g.43044295_43125483dup
     babelfish.vcf_to_g_hgvs("17", 43044294, "G", "<DUP>", svlen=81189)
 
+Batches keep the input order and report each record independently, so a bad record can be written
+back to its source row without losing the others::
+
+    result = babelfish.batch_hgvs_to_vcf([hgvs_string, parser.parse(hgvs_object), "not HGVS"])
+    for item in result:
+        ...  # a VCFCoordinate, or a BatchItemFailure
+    result.total, result.success_count, result.failure_count  # (3, 2, 1)
+    result.failure_summary  # {"input": 1}
+
 A VCFCoordinate holds the sequence accession, as the rest of hgvs does. Babelfish converts it to
 and from the VCF CHROM name: the chromosome name ("17") by default, or the accession itself with
 chrom_style="accession". The VCF header needs ##ALT lines for DEL/DUP/INV and ##INFO lines for
 SVTYPE, SVLEN and END. SVLEN follows vcf_version (default 4.3, where a deletion's SVLEN is negative).
 """
 
+import copy
 from dataclasses import dataclass, replace
 
 from bioutils.assemblies import make_ac_name_map, make_name_ac_map
@@ -31,8 +41,10 @@ from bioutils.sequences import reverse_complement
 import hgvs
 import hgvs.normalizer
 from hgvs.edit import Dup, Inv, NARefAlt
+from hgvs.exceptions import HGVSDataNotAvailableError, HGVSError, HGVSUsageError
 from hgvs.location import Interval, SimplePosition
 from hgvs.normalizer import Normalizer
+from hgvs.parsers import Parser
 from hgvs.posedit import PosEdit
 from hgvs.sequencevariant import SequenceVariant
 from hgvs.utils.position import get_start_end_interbase
@@ -50,6 +62,91 @@ DEFAULT_NORMALIZE_MAX_LENGTH = 1_000_000
 DEFAULT_VCF_VERSION = "4.3"
 # VCF CHROM as the chromosome name ("17") or the sequence accession ("NC_000017.11")
 CHROM_STYLES = ("name", "accession")
+# Batch directions, recorded on each failure for write-back to the source row
+DIRECTION_HGVS_TO_VCF = "hgvs_to_vcf"
+DIRECTION_VCF_TO_HGVS = "vcf_to_hgvs"
+DIRECTIONS = (DIRECTION_HGVS_TO_VCF, DIRECTION_VCF_TO_HGVS)
+# A record is wrong itself (bad HGVS, missing END/SVLEN, bad coordinates, unknown contig), or the
+# reference data needed to convert it could not be fetched
+ERROR_INPUT = "input"
+ERROR_DATA = "data"
+ERROR_TYPES = (ERROR_INPUT, ERROR_DATA)
+# Largest batch accepted unless overridden per call or in __init__; None disables the limit
+DEFAULT_BATCH_MAX_RECORDS = 10_000
+# The fixed VCF columns: CHROM, POS, ID, REF, ALT, QUAL, FILTER, INFO
+VCF_MIN_RECORD_FIELDS = 5
+VCF_INFO_FIELD_INDEX = 7
+# Failures a single record can produce, as opposed to misuse of the batch entry point itself
+_RECORD_ERRORS = (HGVSError, ValueError, KeyError, TypeError, RuntimeError, AttributeError)
+
+
+def _classify_record_error(exc):
+    """error type (see ERROR_TYPES) for an exception raised converting one record. A reference
+    sequence that can't be fetched is a data error; anything else is the record's own fault."""
+    if isinstance(exc, HGVSDataNotAvailableError):
+        return ERROR_DATA
+    return ERROR_INPUT
+
+
+@dataclass(frozen=True)
+class BatchItemFailure:
+    """One record that could not be converted. index is its position in the batch (0-based),
+    direction is one of DIRECTIONS and error_type one of ERROR_TYPES. message is the original
+    error text, for writing back to the source row."""
+
+    index: int
+    direction: str
+    error_type: str
+    message: str
+
+    def __str__(self):
+        return f"{self.direction}[{self.index}]: {self.error_type}: {self.message}"
+
+
+@dataclass(frozen=True)
+class BatchResult:
+    """Per-record results of a batch conversion, in the original input order. Each item is the
+    successful conversion (a VCFCoordinate or a g. SequenceVariant) or a BatchItemFailure."""
+
+    direction: str
+    items: tuple
+
+    def __iter__(self):
+        return iter(self.items)
+
+    def __len__(self):
+        return len(self.items)
+
+    def __getitem__(self, index):
+        return self.items[index]
+
+    @property
+    def total(self):
+        return len(self.items)
+
+    @property
+    def success_count(self):
+        return sum(not isinstance(item, BatchItemFailure) for item in self.items)
+
+    @property
+    def failure_count(self):
+        return sum(isinstance(item, BatchItemFailure) for item in self.items)
+
+    @property
+    def successes(self):
+        return tuple(item for item in self.items if not isinstance(item, BatchItemFailure))
+
+    @property
+    def failures(self):
+        return tuple(item for item in self.items if isinstance(item, BatchItemFailure))
+
+    @property
+    def failure_summary(self):
+        """count of failures by error_type, eg {"input": 2, "data": 1}"""
+        summary = {}
+        for failure in self.failures:
+            summary[failure.error_type] = summary.get(failure.error_type, 0) + 1
+        return summary
 
 
 def _check_vcf_version(vcf_version):
@@ -140,6 +237,7 @@ class Babelfish:
         *,
         vcf_version=DEFAULT_VCF_VERSION,
         chrom_style="name",
+        batch_max_records=DEFAULT_BATCH_MAX_RECORDS,
     ):
         """symbolic_alt_min_length: a del, dup or inv spanning at least this many bases is
         written to and read from VCF as a symbolic allele (<DEL>, <DUP>, <INV>), and smaller
@@ -158,6 +256,9 @@ class Babelfish:
         chrom_style: VCF CHROM written by hgvs_to_vcf and vcf_chrom - "name" (the default) for
         the chromosome name without a "chr" prefix (eg "17"), or "accession" for the sequence
         accession (eg "NC_000017.11"). Either is read.
+
+        batch_max_records: default upper limit on batch_hgvs_to_vcf/batch_vcf_to_g_hgvs, which
+        each call may override with max_records. None disables the limit.
         """
         _check_vcf_version(vcf_version)
         if chrom_style not in CHROM_STYLES:
@@ -172,11 +273,13 @@ class Babelfish:
         elif normalize_max_length is not None:
             msg = "normalize_max_length requires symbolic_alt_min_length"
             raise ValueError(msg)
+        self._check_batch_max_records(batch_max_records)
         self.assembly_name = assembly_name
         self.symbolic_alt_min_length = symbolic_alt_min_length
         self.normalize_max_length = normalize_max_length
         self.vcf_version = vcf_version
         self.chrom_style = chrom_style
+        self.batch_max_records = batch_max_records
         self.hdp = hdp
         self.hn = hgvs.normalizer.Normalizer(
             hdp, cross_boundaries=False, shuffle_direction=5, validate=False
@@ -185,6 +288,16 @@ class Babelfish:
         self.name_to_ac_map = make_name_ac_map(assembly_name)
         # We need to accept accessions as chromosome names, so add them pointing at themselves
         self.name_to_ac_map.update({ac: ac for ac in self.name_to_ac_map.values()})
+        # Built lazily: a grammar is only needed to parse HGVS strings in a batch
+        self._parser = None
+
+    @staticmethod
+    def _check_batch_max_records(max_records):
+        if max_records is not None and (
+            isinstance(max_records, bool) or not isinstance(max_records, int) or max_records <= 0
+        ):
+            msg = f"max_records must be a positive integer or None, not {max_records!r}"
+            raise ValueError(msg)
 
     def hgvs_to_vcf(self, var_g):
         """**EXPERIMENTAL**
@@ -206,6 +319,46 @@ class Babelfish:
         """
         vc, _ = self._hgvs_to_vcf(var_g)
         return vc
+
+    def batch_hgvs_to_vcf(self, variants, *, max_records=None):
+        """**EXPERIMENTAL**
+
+        Convert a batch of g. HGVS variants to VCFCoordinates, one result per input, in input
+        order. Each variant is an HGVS string (parsed here) or an already-parsed SequenceVariant.
+        A failed record is a BatchItemFailure with its index, direction and error type, and never
+        aborts the batch or affects another record. Normalization, symbolic alleles, SVLEN sign
+        and CHROM naming are identical to hgvs_to_vcf_coordinate.
+
+        An empty batch, a single record instead of a sequence, or more than max_records
+        (default batch_max_records) raises HGVSUsageError.
+        """
+        return self._run_batch(
+            variants, DIRECTION_HGVS_TO_VCF, self._batch_one_hgvs_to_vcf, max_records
+        )
+
+    def batch_vcf_to_g_hgvs(self, records, *, max_records=None):
+        """**EXPERIMENTAL**
+
+        Convert a batch of VCF records to g. SequenceVariants, one result per input, in input
+        order. Each record is a VCFCoordinate or a VCF record line (tab-separated CHROM, POS, ID,
+        REF, ALT, QUAL, FILTER, INFO), with END/SVLEN read from INFO for symbolic alleles. A
+        failed record is a BatchItemFailure with its index, direction and error type, and never
+        aborts the batch or affects another record. A symbolic allele missing END and SVLEN is an
+        input error; a reference sequence that can't be fetched is a data error.
+
+        An empty batch, a single record instead of a sequence, or more than max_records
+        (default batch_max_records) raises HGVSUsageError.
+        """
+        return self._run_batch(
+            records, DIRECTION_VCF_TO_HGVS, self._batch_one_vcf_to_g_hgvs, max_records
+        )
+
+    @property
+    def parser(self):
+        """Parser used for HGVS strings in batch_hgvs_to_vcf (built lazily)"""
+        if self._parser is None:
+            self._parser = Parser()
+        return self._parser
 
     def vcf_chrom(self, vc):
         """VCF CHROM for a VCFCoordinate in this Babelfish's chrom_style (see __init__)"""
@@ -455,3 +608,103 @@ class Babelfish:
                 edit,
             ),
         )
+
+    def _run_batch(self, records, direction, convert_one, max_records):
+        """Validate the batch itself, then convert each record independently: an exception from
+        one is recorded as a BatchItemFailure at its index instead of stopping the batch."""
+        indexed_records = self._check_batch(records, direction, max_records)
+        items = []
+        for index, record in indexed_records:
+            try:
+                items.append(convert_one(record))
+            except _RECORD_ERRORS as exc:
+                items.append(
+                    BatchItemFailure(
+                        index=index,
+                        direction=direction,
+                        error_type=_classify_record_error(exc),
+                        message=str(exc) or exc.__class__.__name__,
+                    )
+                )
+        return BatchResult(direction=direction, items=tuple(items))
+
+    def _check_batch(self, records, direction, max_records):
+        """List of (index, record), or HGVSUsageError if records isn't a non-empty sequence
+        within the size limit"""
+        if isinstance(records, (str, bytes)) or not hasattr(records, "__iter__"):
+            msg = (
+                f"{direction} expects a non-empty sequence of records, "
+                f"not a single {type(records).__name__}"
+            )
+            raise HGVSUsageError(msg)
+        indexed_records = list(enumerate(records))
+        if not indexed_records:
+            msg = f"{direction} batch must contain at least one record"
+            raise HGVSUsageError(msg)
+        if max_records is None:
+            max_records = self.batch_max_records
+        self._check_batch_max_records(max_records)
+        if max_records is not None and len(indexed_records) > max_records:
+            msg = (
+                f"{direction} batch has {len(indexed_records)} records, "
+                f"which exceeds the max_records limit of {max_records}"
+            )
+            raise HGVSUsageError(msg)
+        return indexed_records
+
+    def _batch_one_hgvs_to_vcf(self, record):
+        """VCFCoordinate for one HGVS string or parsed SequenceVariant. A copy is normalized,
+        so a failed normalization (which fills in ref) can't mutate the caller's object."""
+        if isinstance(record, str):
+            var_g = self.parser.parse(record)
+        elif isinstance(record, SequenceVariant):
+            var_g = copy.deepcopy(record)
+        else:
+            msg = (
+                "HGVS batch records must be an HGVS string or a parsed SequenceVariant, "
+                f"not {type(record).__name__}"
+            )
+            raise TypeError(msg)
+        vc, _typ = self._hgvs_to_vcf(var_g)
+        return vc
+
+    def _batch_one_vcf_to_g_hgvs(self, record):
+        """g. SequenceVariant for one VCFCoordinate or tab-separated VCF record line"""
+        if isinstance(record, VCFCoordinate):
+            vc = record
+        elif isinstance(record, str):
+            chrom, position, ref, alt, end, svlen = self._parse_vcf_record_line(record)
+            vc = self.vcf_coordinate(chrom, position, ref, alt, end=end, svlen=svlen)
+        else:
+            msg = (
+                "VCF batch records must be a VCFCoordinate or a VCF record line string, "
+                f"not {type(record).__name__}"
+            )
+            raise TypeError(msg)
+        return self.vcf_coordinate_to_g_hgvs(vc)
+
+    @staticmethod
+    def _parse_vcf_record_line(line):
+        """(chrom, position, ref, alt, end, svlen) from a tab-separated VCF record line.
+        END and SVLEN come from the INFO column, for symbolic alleles."""
+        fields = line.rstrip("\r\n").split("\t")
+        if len(fields) < VCF_MIN_RECORD_FIELDS:
+            msg = f"VCF record needs at least CHROM, POS, ID, REF and ALT columns: {line!r}"
+            raise ValueError(msg)
+        chrom, position_s, _id, ref, alt = fields[:VCF_MIN_RECORD_FIELDS]
+        try:
+            position = int(position_s)
+        except ValueError:
+            msg = f"invalid VCF POS {position_s!r} in {line!r}"
+            raise ValueError(msg) from None
+        if "," in alt:
+            msg = f"one batch record per ALT allele; {alt!r} lists several"
+            raise ValueError(msg)
+        end = svlen = None
+        if len(fields) > VCF_INFO_FIELD_INDEX and fields[VCF_INFO_FIELD_INDEX] not in ("", "."):
+            for info_field in fields[VCF_INFO_FIELD_INDEX].split(";"):
+                if info_field.startswith("END="):
+                    end = int(info_field[len("END=") :])
+                elif info_field.startswith("SVLEN="):
+                    svlen = int(info_field[len("SVLEN=") :])
+        return chrom, position, ref, alt, end, svlen

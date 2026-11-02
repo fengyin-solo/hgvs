@@ -4,7 +4,19 @@ from types import SimpleNamespace
 import pytest
 from bioutils.sequences import reverse_complement
 
-from hgvs.extras.babelfish import SYMBOLIC_ALTS, Babelfish, VCFCoordinate, _common_prefix_len
+from hgvs.exceptions import HGVSDataNotAvailableError, HGVSUsageError
+from hgvs.extras.babelfish import (
+    DIRECTION_HGVS_TO_VCF,
+    DIRECTION_VCF_TO_HGVS,
+    ERROR_DATA,
+    ERROR_INPUT,
+    SYMBOLIC_ALTS,
+    Babelfish,
+    BatchItemFailure,
+    BatchResult,
+    VCFCoordinate,
+    _common_prefix_len,
+)
 
 SYMBOLIC_TYPES = {v: k for k, v in SYMBOLIC_ALTS.items()}
 CHR2 = "NC_000002.12"
@@ -441,3 +453,236 @@ def test_common_prefix_len_partial_full_empty():
     assert _common_prefix_len("ACGT", "TGCA") == 0
     assert _common_prefix_len("", "ACGT") == 0
     assert _common_prefix_len("A", "") == 0
+
+
+class _DataErrorHDP:
+    """Every reference sequence lookup fails, as when SeqRepo/UTA has no data"""
+
+    def get_seq(self, ac, start_i=None, end_i=None):  # noqa: ARG002
+        msg = f"No sequence available for {ac}"
+        raise HGVSDataNotAvailableError(msg)
+
+
+@pytest.fixture
+def data_error_babelfish():
+    return Babelfish(
+        _DataErrorHDP(),
+        assembly_name="GRCh38",
+        symbolic_alt_min_length=50,
+        normalize_max_length=100,
+    )
+
+
+def _vcf_line(chrom, position, ref, alt, info="."):
+    return "\t".join([str(chrom), str(position), ".", ref, alt, ".", ".", info])
+
+
+def test_batch_hgvs_to_vcf_mixed(parser, synthetic_babelfish):
+    """Both directions of the input forms and allele forms, failures interleaved with successes"""
+    seq = synthetic_babelfish.hdp.seq
+    inv_string = "NC_000002.12:g.101_120inv"
+    big_del = parser.parse("NC_000002.12:g.700_900del")
+    big_dup_string = "NC_000002.12:g.700_900dup"
+    inv_object = parser.parse(inv_string)
+    records = [
+        "this is not HGVS",  # 0: unparseable string - input error
+        inv_string,  # 1: explicit inv from string - success
+        parser.parse("NM_000059.4:c.100del"),  # 2: not a g. variant - input error
+        big_del,  # 3: symbolic del from object - success
+        big_dup_string,  # 4: symbolic dup from string - success
+        inv_object,  # 5: explicit inv from object - success
+    ]
+
+    result = synthetic_babelfish.batch_hgvs_to_vcf(records)
+
+    assert isinstance(result, BatchResult)
+    assert result.direction == DIRECTION_HGVS_TO_VCF
+    assert result.total == 6
+    assert result.success_count == 4
+    assert result.failure_count == 2
+    assert result.failure_summary == {ERROR_INPUT: 2}
+    assert [type(item).__name__ for item in result] == [
+        "BatchItemFailure",
+        "VCFCoordinate",
+        "BatchItemFailure",
+        "VCFCoordinate",
+        "VCFCoordinate",
+        "VCFCoordinate",
+    ]
+
+    failures = result.failures
+    assert [f.index for f in failures] == [0, 2]
+    assert all(f.direction == DIRECTION_HGVS_TO_VCF for f in failures)
+    assert all(f.error_type == ERROR_INPUT for f in failures)
+
+    # Successes are exactly what the single-record interface gives
+    assert result[1] == synthetic_babelfish.hgvs_to_vcf_coordinate(parser.parse(inv_string))
+    assert result[3] == synthetic_babelfish.hgvs_to_vcf_coordinate(big_del)
+    assert result[4] == synthetic_babelfish.hgvs_to_vcf_coordinate(parser.parse(big_dup_string))
+    assert result[5] == synthetic_babelfish.hgvs_to_vcf_coordinate(inv_object)
+
+    # Explicit vs symbolic, and the existing CHROM naming and SVLEN sign rules are kept
+    assert not result[1].is_symbolic
+    assert result[1].ref == seq[100:120]
+    assert result[3].is_symbolic
+    assert result[3].alt == "<DEL>"
+    assert result[3] == VCFCoordinate(CHR2, 699, seq[698], "<DEL>", end=900)
+    assert synthetic_babelfish.vcf_chrom(result[3]) == "2"
+    assert synthetic_babelfish.vcf_info(result[3])["SVLEN"] == -201  # VCF 4.3 deletion
+    assert result[4].alt == "<DUP>"
+    assert synthetic_babelfish.vcf_info(result[4])["SVLEN"] == 201
+
+
+def test_batch_vcf_to_g_hgvs_mixed(synthetic_babelfish):
+    """VCFCoordinate objects and VCF lines, symbolic (END and SVLEN, either sign) and explicit"""
+    seq = synthetic_babelfish.hdp.seq
+    position, end = 500, 560
+    pad = seq[position - 1]
+    explicit_inv = VCFCoordinate(CHR2, 101, seq[100:120], reverse_complement(seq[100:120]))
+    symbolic_del = VCFCoordinate(CHR2, position, pad, "<DEL>", end)
+    records = [
+        _vcf_line(2, 999999, "T", "<DEL>"),  # 0: symbolic without END/SVLEN - input error
+        explicit_inv,  # 1: explicit object - success
+        "garbage",  # 2: not a VCF line - input error
+        symbolic_del,  # 3: symbolic object with END - success
+        _vcf_line(2, position, pad, "<DEL>", f"SVTYPE=DEL;END={end}"),  # 4: END from INFO
+        _vcf_line(2, position, pad, "<DEL>", "SVLEN=-60"),  # 5: negative SVLEN (VCF 4.3)
+        _vcf_line(2, position, pad, "<DUP>", "SVLEN=60"),  # 6: positive SVLEN
+        _vcf_line(2, position, "T", "<CNV>", f"END={end}"),  # 7: unsupported symbolic alt
+    ]
+
+    result = synthetic_babelfish.batch_vcf_to_g_hgvs(records)
+
+    assert result.direction == DIRECTION_VCF_TO_HGVS
+    assert result.total == 8
+    assert result.success_count == 5
+    assert result.failure_count == 3
+    assert result.failure_summary == {ERROR_INPUT: 3}
+    assert [type(item).__name__ for item in result] == [
+        "BatchItemFailure",
+        "SequenceVariant",
+        "BatchItemFailure",
+        "SequenceVariant",
+        "SequenceVariant",
+        "SequenceVariant",
+        "SequenceVariant",
+        "BatchItemFailure",
+    ]
+
+    failures = result.failures
+    assert [f.index for f in failures] == [0, 2, 7]
+    assert all(f.direction == DIRECTION_VCF_TO_HGVS for f in failures)
+    assert all(f.error_type == ERROR_INPUT for f in failures)
+    assert "end or svlen" in failures[0].message
+    assert "CHROM, POS, ID, REF and ALT" in failures[1].message
+    assert "Unsupported" in failures[2].message
+
+    # Successes match the single-record interface, and all symbolic forms agree
+    assert result[1] == synthetic_babelfish.vcf_coordinate_to_g_hgvs(explicit_inv)
+    assert result[1].format() == "NC_000002.12:g.101_120inv"
+    expected_del = synthetic_babelfish.vcf_coordinate_to_g_hgvs(symbolic_del)
+    assert result[3] == expected_del
+    assert result[4] == expected_del
+    assert result[5] == expected_del
+    assert expected_del.format() == "NC_000002.12:g.501_560del"
+    assert result[6].format() == "NC_000002.12:g.501_560dup"
+
+
+def test_batch_order_stable_and_isolated(parser, synthetic_babelfish):
+    """A generator input works, indices stay in source order, and a failure doesn't skip records"""
+    inv_string = "NC_000002.12:g.101_120inv"
+    records = (x for x in ["bad", inv_string, "also bad", parser.parse("NM_000059.4:c.1A>G")])
+
+    result = synthetic_babelfish.batch_hgvs_to_vcf(records)
+
+    assert [i for i, item in enumerate(result) if isinstance(item, BatchItemFailure)] == [0, 2, 3]
+    assert [f.index for f in result.failures] == [0, 2, 3]
+    assert result[1] == synthetic_babelfish.hgvs_to_vcf_coordinate(parser.parse(inv_string))
+
+    # An item of the wrong type, and None, fail at their own index instead of aborting the batch
+    result = synthetic_babelfish.batch_hgvs_to_vcf([inv_string, None, 42])
+    assert result.success_count == 1
+    assert [f.index for f in result.failures] == [1, 2]
+    assert {f.error_type for f in result.failures} == {ERROR_INPUT}
+
+
+def test_batch_empty_and_limit(synthetic_babelfish):
+    """Empty batches, single records and oversize batches are usage errors, not per-row failures"""
+    for batch in (
+        lambda: synthetic_babelfish.batch_hgvs_to_vcf([]),
+        lambda: synthetic_babelfish.batch_vcf_to_g_hgvs([]),
+    ):
+        with pytest.raises(HGVSUsageError, match="at least one record"):
+            batch()
+
+    # A single string/object is a usage error: callers must pass a sequence of records
+    with pytest.raises(HGVSUsageError, match="single str"):
+        synthetic_babelfish.batch_hgvs_to_vcf("NC_000002.12:g.101_120inv")
+    with pytest.raises(HGVSUsageError, match="single VCFCoordinate"):
+        synthetic_babelfish.batch_vcf_to_g_hgvs(VCFCoordinate(CHR2, 100, "AT", "A"))
+    with pytest.raises(HGVSUsageError, match="single NoneType"):
+        synthetic_babelfish.batch_hgvs_to_vcf(None)
+
+    # Configurable limit: constructor default and a per-call override
+    small = Babelfish(
+        synthetic_babelfish.hdp,
+        "GRCh38",
+        symbolic_alt_min_length=50,
+        normalize_max_length=100,
+        batch_max_records=2,
+    )
+    records = ["NC_000002.12:g.101_120inv"] * 3
+    with pytest.raises(HGVSUsageError, match="exceeds the max_records limit of 2"):
+        small.batch_hgvs_to_vcf(records)
+    # The per-call override wins
+    assert small.batch_hgvs_to_vcf(records, max_records=3).total == 3
+    # None disables the limit
+    unlimited = Babelfish(synthetic_babelfish.hdp, "GRCh38", batch_max_records=None)
+    assert unlimited.batch_hgvs_to_vcf(records[:2]).total == 2
+
+    for bad_limit in (0, -1, "2", True):
+        with pytest.raises(ValueError, match="max_records"):
+            Babelfish(synthetic_babelfish.hdp, "GRCh38", batch_max_records=bad_limit)
+        with pytest.raises(ValueError, match="max_records"):
+            synthetic_babelfish.batch_hgvs_to_vcf(records[:1], max_records=bad_limit)
+
+
+def test_batch_data_errors(data_error_babelfish):
+    """Reference sequence fetch failures stay data errors; other bad rows stay input errors,
+    and a symbolic allele large enough to skip normalization succeeds without sequence data."""
+    hgvs_result = data_error_babelfish.batch_hgvs_to_vcf([
+        "NC_000002.12:g.100_102del",  # normalization needs the reference sequence
+        "not HGVS",
+    ])
+    assert hgvs_result.failure_summary == {ERROR_DATA: 1, ERROR_INPUT: 1}
+    data_failure = hgvs_result.failures[0]
+    assert data_failure.index == 0
+    assert data_failure.error_type == ERROR_DATA
+    assert data_failure.direction == DIRECTION_HGVS_TO_VCF
+    assert "No sequence" in data_failure.message
+    assert hgvs_result.failures[1].error_type == ERROR_INPUT
+
+    vcf_result = data_error_babelfish.batch_vcf_to_g_hgvs([
+        _vcf_line(2, 100, "AT", "A"),  # explicit del: normalization fetches sequence
+        _vcf_line(2, 500, "A", "<DEL>", "END=560"),  # small symbolic: expanded, fetches
+        _vcf_line(2, 500, "A", "<DEL>", "END=620"),  # >= normalize_max_length: no fetch
+        _vcf_line(2, 500, "A", "<DEL>"),  # missing END and SVLEN: input error
+    ])
+    assert [f.error_type for f in vcf_result.failures] == [
+        ERROR_DATA,
+        ERROR_DATA,
+        ERROR_INPUT,
+    ]
+    assert [f.index for f in vcf_result.failures] == [0, 1, 3]
+    assert vcf_result.success_count == 1
+    assert vcf_result[2].format() == "NC_000002.12:g.501_620del"
+
+
+def test_batch_failure_does_not_mutate_input(parser, data_error_babelfish):
+    """A parsed object handed to a failing conversion is left as the caller had it"""
+    var_g = parser.parse("NC_000002.12:g.100_102dup")
+    before = var_g.format()
+    result = data_error_babelfish.batch_hgvs_to_vcf([var_g])
+    assert result.failure_count == 1
+    assert result.failures[0].error_type == ERROR_DATA
+    assert var_g.format() == before
